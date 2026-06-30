@@ -1,0 +1,17 @@
+# secrets - never commit the API key
+api_key.txt
+.env
+
+# generated data (regenerates itself)
+*.zip
+eta_accuracy_log.csv
+arrivals_log.csv
+
+# python
+__pycache__/
+*.pyc
+
+# misc / scratch
+gui_err.txt
+*.log
+.askpass.sh
