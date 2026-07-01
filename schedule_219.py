@@ -281,6 +281,18 @@ def ready(direction=None, stop_atco=None):
     return key in _partitions and bool(_partitions[key][0])
 
 
+def all_stop_coords(direction=None, stop_atco=None):
+    """Every (lat, lon) with known coordinates across all journeys in one leg's
+    partition. Used to size a bounding box that covers the real route rather
+    than a guessed padding constant."""
+    direction = direction or INBOUND
+    stop_atco = stop_atco or STOP_ATCO
+    warm(direction, stop_atco)
+    _, journeys = _partitions.get((direction, stop_atco), ({}, {}))
+    return [(lat, lon) for seq in journeys.values()
+            for _atco, _secs, lat, lon in seq if lat is not None]
+
+
 def secs_to_local_dt(secs, now):
     """Seconds-of-day (local) -> an aware Europe/London datetime near 'now',
     correcting a possible midnight wrap. 'now' may be any aware datetime."""

@@ -123,6 +123,7 @@ def worker_local():
     try:
         for leg in core.LEGS:
             sch.warm(leg["direction"], leg["stop_atco"])
+        core.refresh_bbox_from_timetable()
     except Exception:
         pass
 

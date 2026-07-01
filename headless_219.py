@@ -204,6 +204,10 @@ def main():
     try:
         for leg in core.LEGS:
             sch.warm(leg["direction"], leg["stop_atco"])
+        if core.refresh_bbox_from_timetable():
+            print(f"bounding box widened to cover the route: "
+                  f"lon {core.BBOX_MIN_LON:.4f}..{core.BBOX_MAX_LON:.4f}, "
+                  f"lat {core.BBOX_MIN_LAT:.4f}..{core.BBOX_MAX_LAT:.4f}")
     except Exception as e:
         print("timetable warm failed (will retry):", e)
 

@@ -68,15 +68,40 @@ SHOW_N = 5
 # here; the GUI loads it from the accuracy log and assigns it.
 CALIBRATION = None
 
-# Bounding box around the stop. Originally biased east only (toward Ashton), on
-# the assumption we only cared about buses approaching from that side. Now that
-# LEGS tracks both directions, we need matching reach on the west (Manchester)
-# side too, for buses approaching the return leg. Symmetric ~4km east/west.
-# Format that BODS wants: minLon,minLat,maxLon,maxLat
+# Bounding box around the stop. Format that BODS wants: minLon,minLat,maxLon,maxLat
+# These are a SAFE FALLBACK (~4km either side) used before the timetable is
+# available. Once it warms, refresh_bbox_from_timetable() widens this to cover
+# every stop actually on the route (the real 219 spans ~19km end to end,
+# Piccadilly to Ashton/Stalybridge/Glossop) - derived from the published data,
+# not a guessed padding constant. A too-small box was causing false missed-bus
+# alarms: a bus that had genuinely just left the terminus was invisible to us
+# for several minutes, indistinguishable from a no-show.
+_BBOX_BUFFER_DEG = 0.01   # ~0.7-1km past the outermost tracked stop
 BBOX_MIN_LON = STOP_LON - 0.06
 BBOX_MAX_LON = STOP_LON + 0.06
 BBOX_MIN_LAT = STOP_LAT - 0.03
 BBOX_MAX_LAT = STOP_LAT + 0.03
+
+
+def refresh_bbox_from_timetable():
+    """Widen the box to cover every stop on every tracked leg's route, using
+    coordinates from the already-downloaded timetable. Cheap and safe to call
+    repeatedly (no network calls). Returns False (leaving the fallback box in
+    place) if that data is not ready yet."""
+    global BBOX_MIN_LON, BBOX_MAX_LON, BBOX_MIN_LAT, BBOX_MAX_LAT
+    import schedule_219 as sch   # local import: schedule_219 imports this module
+    lats, lons = [], []
+    for leg in LEGS:
+        for lat, lon in sch.all_stop_coords(leg["direction"], leg["stop_atco"]):
+            lats.append(lat)
+            lons.append(lon)
+    if not lats:
+        return False
+    BBOX_MIN_LON = min(lons) - _BBOX_BUFFER_DEG
+    BBOX_MAX_LON = max(lons) + _BBOX_BUFFER_DEG
+    BBOX_MIN_LAT = min(lats) - _BBOX_BUFFER_DEG
+    BBOX_MAX_LAT = max(lats) + _BBOX_BUFFER_DEG
+    return True
 
 BODS_URL = "https://data.bus-data.dft.gov.uk/api/v1/datafeed/"
 
