@@ -26,19 +26,30 @@ LONDON = ZoneInfo("Europe/London")
 EARLY_LIMIT = -1.0
 LATE_LIMIT = 5.0
 
+# A delay reading this large is never a real bus running late on a ~20-40 min
+# service - it means the bus got matched to the wrong timetabled journey, or the
+# live feed reported a stale/wrong scheduled time for that vehicle activity. One
+# such row can silently dominate a mean (a single +371 min reading pulled an
+# hour's average from a real ~9 min up to +31 min). We keep the raw row in the
+# CSV untouched (nothing is deleted), but exclude it from the stats and report
+# how many were excluded so this stays visible, not hidden.
+MAX_PLAUSIBLE_DELAY_MIN = 60.0
+
 
 def _on_time(d):
     return EARLY_LIMIT <= d <= LATE_LIMIT
 
 
 def read_exact(path):
-    """[(local_dt, delay_min, snap_dist_km_or_None), ...]. snap_dist_km is the
-    distance (km) between the bus's GPS and the stop it was matched to at
-    arrival - large values mean the route-snap is unreliable for that row, which
-    is exactly the failure mode to check before trusting an odd delay reading."""
+    """Return ([(local_dt, delay_min, snap_dist_km_or_None), ...], excluded_count).
+    snap_dist_km is the distance (km) between the bus's GPS and the stop it was
+    matched to at arrival - large values mean the route-snap is unreliable for
+    that row, which is exactly the failure mode to check before trusting an odd
+    delay reading."""
     if not os.path.exists(path):
-        return None
+        return None, 0
     out = []
+    excluded = 0
     with open(path, newline="", encoding="utf-8") as f:
         for r in csv.DictReader(f):
             try:
@@ -46,13 +57,16 @@ def read_exact(path):
                 delay = float(r["delay_min"])
             except (ValueError, KeyError):
                 continue
+            if abs(delay) > MAX_PLAUSIBLE_DELAY_MIN:
+                excluded += 1
+                continue
             snap = r.get("snap_dist_km")
             try:
                 snap = float(snap) if snap else None
             except ValueError:
                 snap = None
             out.append((dt, delay, snap))
-    return out or None
+    return (out or None), excluded
 
 
 def _nearest_delay_min(arr_local, sched_secs):
@@ -67,17 +81,17 @@ def _nearest_delay_min(arr_local, sched_secs):
 
 
 def _delays(arrivals_path, accuracy_path, direction, stop_atco):
-    """Return (source, [(local_dt, delay_min, snap_dist_km_or_None), ...])."""
-    exact = read_exact(arrivals_path)
+    """Return (source, [(local_dt, delay_min, snap_dist_km_or_None), ...], excluded)."""
+    exact, excluded = read_exact(arrivals_path)
     if exact:
-        return "exact", exact
+        return "exact", exact, excluded
     sched = sch.warm(direction, stop_atco)
     sched_secs = sorted(set(sched.values()))
     if not sched_secs:
-        return "none", []
+        return "none", [], 0
     seen = {}
     if not os.path.exists(accuracy_path):
-        return "exact", []
+        return "exact", [], 0
     with open(accuracy_path, newline="", encoding="utf-8") as f:
         for r in csv.DictReader(f):
             key = (r.get("vehicle"), r.get("actual_arrival"))
@@ -87,8 +101,8 @@ def _delays(arrivals_path, accuracy_path, direction, stop_atco):
                 seen[key] = datetime.fromisoformat(r["actual_arrival"]).astimezone(LONDON)
             except (ValueError, KeyError):
                 continue
-    return "reconstructed", [(a, _nearest_delay_min(a, sched_secs), None)
-                             for a in sorted(seen.values())]
+    return ("reconstructed",
+            [(a, _nearest_delay_min(a, sched_secs), None) for a in sorted(seen.values())], 0)
 
 
 def compute(arrivals_path=None, accuracy_path=None, direction=None, stop_atco=None):
@@ -98,7 +112,7 @@ def compute(arrivals_path=None, accuracy_path=None, direction=None, stop_atco=No
     accuracy_path = accuracy_path or core.ACCURACY_LOG_PATH
     direction = direction or core.DIRECTION
     stop_atco = stop_atco or core.STOP_ATCO
-    source, triples = _delays(arrivals_path, accuracy_path, direction, stop_atco)
+    source, triples, excluded = _delays(arrivals_path, accuracy_path, direction, stop_atco)
     if not triples:
         return None
     triples = sorted(triples, key=lambda x: x[0])
@@ -129,6 +143,7 @@ def compute(arrivals_path=None, accuracy_path=None, direction=None, stop_atco=No
     return {
         "source": source,
         "n": len(delays),
+        "excluded_implausible": excluded,   # rows with |delay| > MAX_PLAUSIBLE_DELAY_MIN
         "on_time_pct": round(100 * sum(ot) / len(ot)),
         "median": round(statistics.median(delays), 1),
         "window": f"{times[0]:%d %b %H:%M}-{times[-1]:%H:%M}",
@@ -156,6 +171,10 @@ def main():
     print(f"source: {s['source']}   window: {s['window']}   buses: {s['n']}")
     print(f"on time (-1 to +5 min): {s['on_time_pct']}%   "
           f"median delay: {s['median']:+.1f} min")
+    if s.get("excluded_implausible"):
+        print(f"(excluded {s['excluded_implausible']} row(s) with |delay| > "
+              f"{MAX_PLAUSIBLE_DELAY_MIN:.0f} min - almost certainly a wrong "
+              f"journey match or a stale feed value, not a real delay)")
     print("\nby hour:  hr   n  on-time  avg     avg snap dist")
     for h, n, otp, avg, snap_m in s["by_hour"]:
         snap_txt = f"{snap_m}m" if snap_m is not None else "n/a"
