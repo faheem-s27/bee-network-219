@@ -14,11 +14,6 @@ the Pi via presentation.py.
 
 HONESTY: "~" before a time = estimate. on-time plain = measured delay, with a ~
 = estimated. Not an official time.
-
-ALERT: since the stop is right at the door, there is no "leave in N minutes"
-walk-time to calculate - by the time a bus reads DUE, that IS the moment to go.
-So instead of a walk-time alert, the window beeps once (winsound) the instant
-any leg's next bus flips to DUE, so you do not have to keep watching the screen.
 """
 
 import threading
@@ -29,11 +24,6 @@ from datetime import datetime, timezone
 import requests
 
 import next_219 as core
-
-try:
-    import winsound
-except ImportError:
-    winsound = None
 
 # Point at the Pi's JSON endpoint to run as a thin client. None = compute locally.
 REMOTE_URL = "http://fams:8219/"
@@ -57,7 +47,6 @@ MAX_ROWS = 3
 _state = {"legs": {}, "updated": None, "error": None}
 _lock = threading.Lock()
 _stop = threading.Event()
-_prev_due = {}   # (leg_key, vehicle) -> bool, to beep only on the DUE transition
 
 
 def _publish(generated, legs, error=None):
@@ -67,32 +56,13 @@ def _publish(generated, legs, error=None):
         _state["error"] = error
 
 
-def _beep_on_new_due(legs):
-    if winsound is None:
-        return
-    for key, data in legs.items():
-        for r in data.get("arrivals", []):
-            veh = r.get("vehicle")
-            if not veh:
-                continue
-            was_due = _prev_due.get((key, veh), False)
-            if r.get("due") and not was_due:
-                try:
-                    winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
-                except Exception:
-                    pass
-            _prev_due[(key, veh)] = bool(r.get("due"))
-
-
 def worker_remote():
     while not _stop.is_set():
         try:
             data = requests.get(REMOTE_URL, timeout=10).json()
             gen = data.get("generated")
             generated = datetime.fromisoformat(gen) if gen else datetime.now(timezone.utc)
-            legs = data.get("legs", {})
-            _beep_on_new_due(legs)
-            _publish(generated, legs)
+            _publish(generated, data.get("legs", {}))
         except Exception as e:
             with _lock:
                 _state["error"] = str(e)
@@ -180,7 +150,6 @@ def worker_local():
                     "n": len(lv), "arrivals": [presentation.row(v, now, leg) for v in cands[:5]],
                     "gap_warning": None, "reliability": rel,
                 }
-            _beep_on_new_due(legs_out)
             _publish(now, legs_out)
         except Exception as e:
             with _lock:
@@ -284,7 +253,7 @@ class Board:
         self.model.pack(anchor="w")
         tk.Label(foot, text="strip: right = your stop, dots = stops, markers = buses.",
                  font=(MONO, 9), bg=BG, fg=AMBER_DIM, anchor="w").pack(anchor="w")
-        tk.Label(foot, text="on-time: plain = measured, ~ = estimated. beeps once when DUE.",
+        tk.Label(foot, text="on-time: plain = measured, ~ = estimated. not official.",
                  font=(MONO, 9), bg=BG, fg=AMBER_DIM, anchor="w").pack(anchor="w")
 
         self._blink = True
