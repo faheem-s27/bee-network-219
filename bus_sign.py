@@ -1,20 +1,24 @@
 """
-Little bus-stop departure board.
+Little bus-stop departure board. Tracks every leg in route_config.LEGS (by
+default: out and back) with a tab to switch which one is shown.
 
 Two modes:
-  REMOTE (default): a thin client. Reads already-computed arrivals from the Pi's
-  JSON endpoint and draws them. No feed/timetable/model on this machine. It even
-  takes the line number and labels from the Pi, so switching routes is a Pi-only
-  change and this window just follows.
+  REMOTE (default): a thin client. Reads already-computed legs from the Pi's
+  JSON endpoint and draws them. No feed/timetable/model on this machine.
 
   LOCAL: set REMOTE_URL = None to compute everything in-process.
 
-Shows a route strip (your stop at the right, each approaching bus placed by how
-many stops away it is) plus the next arrivals. Display formatting is shared with
+Shows a route strip (your stop at the right, buses placed by stops-away) plus
+the next arrivals and a reliability panel. Display formatting is shared with
 the Pi via presentation.py.
 
-HONESTY: "~" before a time = estimate. on-time plain = measured delay, with a ~ =
-estimated. Not an official time.
+HONESTY: "~" before a time = estimate. on-time plain = measured delay, with a ~
+= estimated. Not an official time.
+
+ALERT: since the stop is right at the door, there is no "leave in N minutes"
+walk-time to calculate - by the time a bus reads DUE, that IS the moment to go.
+So instead of a walk-time alert, the window beeps once (winsound) the instant
+any leg's next bus flips to DUE, so you do not have to keep watching the screen.
 """
 
 import threading
@@ -25,6 +29,11 @@ from datetime import datetime, timezone
 import requests
 
 import next_219 as core
+
+try:
+    import winsound
+except ImportError:
+    winsound = None
 
 # Point at the Pi's JSON endpoint to run as a thin client. None = compute locally.
 REMOTE_URL = "http://fams:8219/"
@@ -45,18 +54,34 @@ STATUS_COLOURS = {"ontime": GREEN, "late": RED, "early": BLUE}
 REFRESH_MS = 500
 MAX_ROWS = 3
 
-_state = {"rows": [], "updated": None, "error": None, "n": 0, "model": "",
-          "line": core.LINE_REF, "dest_label": core.DEST_LABEL, "stop": core.STOP_NAME,
-          "reliability": None}
+_state = {"legs": {}, "updated": None, "error": None}
 _lock = threading.Lock()
 _stop = threading.Event()
+_prev_due = {}   # (leg_key, vehicle) -> bool, to beep only on the DUE transition
 
 
-def _publish(rows, generated, n, model, line, dest_label, stop, reliability=None):
+def _publish(generated, legs, error=None):
     with _lock:
-        _state.update(rows=rows[:MAX_ROWS], updated=generated, error=None, n=n,
-                      model=model, line=line, dest_label=dest_label, stop=stop,
-                      reliability=reliability)
+        _state["legs"] = legs
+        _state["updated"] = generated
+        _state["error"] = error
+
+
+def _beep_on_new_due(legs):
+    if winsound is None:
+        return
+    for key, data in legs.items():
+        for r in data.get("arrivals", []):
+            veh = r.get("vehicle")
+            if not veh:
+                continue
+            was_due = _prev_due.get((key, veh), False)
+            if r.get("due") and not was_due:
+                try:
+                    winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+                except Exception:
+                    pass
+            _prev_due[(key, veh)] = bool(r.get("due"))
 
 
 def worker_remote():
@@ -65,10 +90,9 @@ def worker_remote():
             data = requests.get(REMOTE_URL, timeout=10).json()
             gen = data.get("generated")
             generated = datetime.fromisoformat(gen) if gen else datetime.now(timezone.utc)
-            _publish(data.get("arrivals", []), generated, data.get("n", 0),
-                     data.get("model", ""), data.get("line", core.LINE_REF),
-                     data.get("dest_label", core.DEST_LABEL),
-                     data.get("stop", core.STOP_NAME), data.get("reliability"))
+            legs = data.get("legs", {})
+            _beep_on_new_due(legs)
+            _publish(generated, legs)
         except Exception as e:
             with _lock:
                 _state["error"] = str(e)
@@ -85,13 +109,20 @@ def worker_local():
     import presentation
     import reliability
 
-    logger = None
+    def leg_paths(leg, i):
+        if i == 0:
+            return core.ACCURACY_LOG_PATH, core.ARRIVALS_LOG_PATH
+        return f"eta_accuracy_log_{leg['key']}.csv", f"arrivals_log_{leg['key']}.csv"
+
+    loggers = {}
     if core.ACCURACY_LOG:
-        logger = core.AccuracyLogger(
-            core.ACCURACY_LOG_PATH, core.ARRIVAL_RADIUS_KM, core.ARRIVAL_COOLDOWN_MIN,
-            core.ARRIVALS_LOG_PATH)
+        for i, leg in enumerate(core.LEGS):
+            acc, arr = leg_paths(leg, i)
+            loggers[leg["key"]] = core.AccuracyLogger(
+                acc, core.ARRIVAL_RADIUS_KM, core.ARRIVAL_COOLDOWN_MIN, arr)
     try:
-        sch.warm()
+        for leg in core.LEGS:
+            sch.warm(leg["direction"], leg["stop_atco"])
     except Exception:
         pass
 
@@ -102,40 +133,54 @@ def worker_local():
         except Exception:
             pass
         try:
-            cal, _ = calibrate.load()
-            core.CALIBRATION = cal
-            model_line = calibrate.model_status()
-        except Exception:
-            model_line = ""
-        try:
-            vehicles = [core.estimate(v, now) for v in core.parse_vehicles(core.fetch_feed())]
-            for v in vehicles:
+            all_vehicles = list(core.parse_vehicles(core.fetch_feed()))
+            legs_out = {}
+            for i, leg in enumerate(core.LEGS):
+                acc, arr = leg_paths(leg, i)
+                lv = []
+                for v in all_vehicles:
+                    v = dict(v)
+                    if core.direction_ok_for(v, leg) is False:
+                        continue
+                    core.estimate_for(v, now, leg)
+                    try:
+                        dm = delay_model.predict(v, now, leg)
+                    except Exception:
+                        dm = None
+                    if dm:
+                        v["stops_away"] = dm["stops_away"]
+                        v["route_arrived"] = dm["arrived"]
+                        v["delay_secs"] = dm["delay_secs"]
+                        v["scheduled_dt"] = dm["scheduled_dt"]
+                        if dm["passed"]:
+                            v["approaching"] = False
+                        else:
+                            v["approaching"] = True
+                            v["eta_min"] = dm["eta_min"]
+                            v["source"] = "delay"
+                    lv.append(v)
+                if loggers.get(leg["key"]) is not None:
+                    loggers[leg["key"]].update(now, lv)
+                cands = [v for v in lv if v["approaching"] is not False]
+                cands.sort(key=lambda x: x["eta_min"])
                 try:
-                    dm = delay_model.predict(v, now)
+                    cal, _ = calibrate.load(acc)
+                    core.CALIBRATION = cal
+                    model_line = calibrate.model_status(acc)
                 except Exception:
-                    dm = None
-                if not dm:
-                    continue
-                v["stops_away"] = dm["stops_away"]
-                v["route_arrived"] = dm["arrived"]
-                v["delay_secs"] = dm["delay_secs"]
-                if dm["passed"]:
-                    v["approaching"] = False
-                else:
-                    v["approaching"] = True
-                    v["eta_min"] = dm["eta_min"]
-                    v["source"] = "delay"
-            if logger is not None:
-                logger.update(now, vehicles)
-            cands = [v for v in vehicles
-                     if core.direction_ok(v) is not False and v["approaching"] is not False]
-            cands.sort(key=lambda x: x["eta_min"])
-            try:
-                rel = reliability.compute()
-            except Exception:
-                rel = None
-            _publish([presentation.row(v, now) for v in cands], now, len(vehicles),
-                     model_line, core.LINE_REF, core.DEST_LABEL, core.STOP_NAME, rel)
+                    model_line = ""
+                try:
+                    rel = reliability.compute(arr, acc, leg["direction"], leg["stop_atco"])
+                except Exception:
+                    rel = None
+                legs_out[leg["key"]] = {
+                    "stop": leg["stop_name"], "line": leg["line_ref"],
+                    "dest_label": leg["dest_label"], "model": model_line,
+                    "n": len(lv), "arrivals": [presentation.row(v, now, leg) for v in cands[:5]],
+                    "gap_warning": None, "reliability": rel,
+                }
+            _beep_on_new_due(legs_out)
+            _publish(now, legs_out)
         except Exception as e:
             with _lock:
                 _state["error"] = str(e)
@@ -148,12 +193,25 @@ def worker_local():
 class Board:
     def __init__(self, root):
         self.root = root
+        self.selected = core.LEGS[0]["key"]
         root.title("Live bus")
         root.configure(bg=BG)
-        root.minsize(560, 650)
+        root.minsize(560, 660)
+
+        # leg tabs (only shown if there is more than one leg)
+        self.tabs_frame = tk.Frame(root, bg=BG)
+        self.tab_buttons = {}
+        if len(core.LEGS) > 1:
+            self.tabs_frame.pack(fill="x", padx=18, pady=(14, 0))
+            for leg in core.LEGS:
+                b = tk.Button(self.tabs_frame, text=f"→ {leg['dest_label']}",
+                              font=(MONO, 9, "bold"), relief="flat", bd=0,
+                              command=lambda k=leg["key"]: self._select(k))
+                b.pack(side="left", padx=(0, 6))
+                self.tab_buttons[leg["key"]] = b
 
         head = tk.Frame(root, bg=BG)
-        head.pack(fill="x", padx=18, pady=(16, 8))
+        head.pack(fill="x", padx=18, pady=(10, 8))
         self.badge = tk.Label(head, text=core.LINE_REF, font=(MONO, 22, "bold"),
                               bg=AMBER, fg="#0a0a0a", padx=8)
         self.badge.pack(side="left")
@@ -168,9 +226,12 @@ class Board:
         self.live = tk.Label(head, text="● LIVE", font=(MONO, 10, "bold"), bg=BG, fg=GREEN)
         self.live.pack(side="right")
 
+        self.gap_lbl = tk.Label(root, text="", font=(MONO, 10, "bold"),
+                                bg=BG, fg=RED, anchor="w")
+        self.gap_lbl.pack(fill="x", padx=18, pady=(0, 4))
+
         tk.Frame(root, bg="#262626", height=1).pack(fill="x", padx=18)
 
-        # route strip
         self.strip = tk.Canvas(root, bg=BG, height=92, highlightthickness=0)
         self.strip.pack(fill="x", padx=18, pady=(8, 0))
 
@@ -222,11 +283,21 @@ class Board:
         self.model.pack(anchor="w")
         tk.Label(foot, text="strip: right = your stop, dots = stops, markers = buses.",
                  font=(MONO, 9), bg=BG, fg=AMBER_DIM, anchor="w").pack(anchor="w")
-        tk.Label(foot, text="on-time: plain = measured, ~ = estimated. not official.",
+        tk.Label(foot, text="on-time: plain = measured, ~ = estimated. beeps once when DUE.",
                  font=(MONO, 9), bg=BG, fg=AMBER_DIM, anchor="w").pack(anchor="w")
 
         self._blink = True
+        self._update_tabs()
         self.refresh()
+
+    def _select(self, key):
+        self.selected = key
+        self._update_tabs()
+
+    def _update_tabs(self):
+        for key, b in self.tab_buttons.items():
+            active = key == self.selected
+            b.config(bg=AMBER if active else PANEL, fg="#0a0a0a" if active else GREY)
 
     def draw_strip(self, rows):
         c = self.strip
@@ -284,7 +355,7 @@ class Board:
         pad, base, maxbar = 28, 40, 32
         slot = (w - 2 * pad) / max(1, len(bh))
         bw = max(8, min(24, slot - 6))
-        for i, (h, cnt, otp, avg) in enumerate(bh):
+        for i, (h, cnt, otp, avg, snap_m) in enumerate(bh):
             x = pad + i * slot + slot / 2
             col = GREEN if otp >= 80 else (AMBER if otp >= 50 else RED)
             c.create_rectangle(x - bw / 2, base - maxbar * otp / 100,
@@ -292,20 +363,35 @@ class Board:
             c.create_text(x, base + 8, text=f"{h:02d}", fill=GREY, font=(MONO, 7))
 
     def refresh(self):
+        try:
+            self._render()
+        except Exception as e:
+            # Never let a drawing error (e.g. a data-shape change) silently kill
+            # the periodic refresh - that freezes the whole window with no sign
+            # of why. Show it in the status line instead, and keep polling.
+            self.status.config(text=f"display error: {e}"[:70], fg=RED)
+        self.root.after(REFRESH_MS, self.refresh)
+
+    def _render(self):
         with _lock:
-            rows = list(_state["rows"])
+            legs = dict(_state["legs"])
             updated = _state["updated"]
             err = _state["error"]
-            n = _state["n"]
-            model_line = _state["model"]
-            line = _state["line"]
-            dest_label = _state["dest_label"]
-            stop = _state["stop"]
-            reliability = _state["reliability"]
+
+        data = legs.get(self.selected, {})
+        rows = data.get("arrivals", [])
+        n = data.get("n", 0)
+        model_line = data.get("model", "")
+        line = data.get("line", core.LINE_REF)
+        dest_label = data.get("dest_label", core.DEST_LABEL)
+        stop = data.get("stop", core.STOP_NAME)
+        reliability = data.get("reliability")
+        gap_warning = data.get("gap_warning")
 
         self.badge.config(text=line)
         self.title_lbl.config(text=f"to {dest_label}")
         self.stop_lbl.config(text=stop)
+        self.gap_lbl.config(text=f"!! {gap_warning}" if gap_warning else "")
         self.draw_strip(rows)
         self.draw_stats(reliability)
 
@@ -349,7 +435,6 @@ class Board:
 
         good = model_line.startswith(("model: delay", "model: learned"))
         self.model.config(text=model_line, fg=GREEN if good else AMBER_DIM)
-        self.root.after(REFRESH_MS, self.refresh)
 
 
 def main():
