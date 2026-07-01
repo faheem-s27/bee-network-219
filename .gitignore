@@ -2,10 +2,10 @@
 api_key.txt
 .env
 
-# generated data (regenerates itself)
+# generated data (regenerates itself) - per-leg files too, e.g. *_to_ashton.csv
 *.zip
-eta_accuracy_log.csv
-arrivals_log.csv
+eta_accuracy_log*.csv
+arrivals_log*.csv
 
 # python
 __pycache__/

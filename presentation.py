@@ -18,6 +18,7 @@ import schedule_219 as sch
 
 LONDON = ZoneInfo("Europe/London")
 ONTIME_BAND_MIN = 1.5
+_DEFAULT_LEG = core.LEGS[0]
 
 
 def _band(diff_min, prefix):
@@ -28,8 +29,8 @@ def _band(diff_min, prefix):
     return f"{prefix}{abs(round(diff_min))} min early", "early"
 
 
-def row(v, now_utc):
-    """Display row for one vehicle. now_utc is an aware UTC datetime."""
+def row(v, now_utc, leg=_DEFAULT_LEG):
+    """Display row for one vehicle on the given leg. now_utc is aware UTC."""
     now_local = now_utc.astimezone(LONDON)
     eta = v["eta_min"]
     due = eta < 1
@@ -39,12 +40,17 @@ def row(v, now_utc):
         label = "DUE" if due else f"~{round(eta)} min"
     expected_dt = now_local + timedelta(minutes=max(0.0, eta))
 
-    sched_dt = None
-    try:
-        if sch.ready():
-            sched_dt = sch.scheduled_lees(v, now_utc)
-    except Exception:
-        sched_dt = None
+    # Prefer the scheduled time the delay model already matched for THIS leg's
+    # stop (attached by the caller). Only fall back to a fresh lookup - using
+    # this leg's own direction/stop, not some other leg's - when that is absent
+    # (the rare case where the geometry model, not the delay model, is in use).
+    sched_dt = v.get("scheduled_dt")
+    if sched_dt is None:
+        try:
+            if sch.ready(leg["direction"], leg["stop_atco"]):
+                sched_dt = sch.scheduled_lees(v, now_utc, leg["direction"], leg["stop_atco"])
+        except Exception:
+            sched_dt = None
 
     if v.get("delay_secs") is not None:                       # measured delay
         status_text, status_kind = _band(v["delay_secs"] / 60.0, "")
@@ -64,7 +70,7 @@ def row(v, now_utc):
         "stops_away": stops_away,
         "status_text": status_text,
         "status_kind": status_kind,
-        "unconfirmed": core.direction_ok(v) is None,
+        "unconfirmed": core.direction_ok_for(v, leg) is None,
         "source": v.get("source"),
         "vehicle": v.get("vehicle"),
     }

@@ -45,10 +45,11 @@ API_KEY = _load_api_key()
 
 # Route/stop settings live in route_config.py (the one file you edit to switch).
 from route_config import (
-    LINE_REF, OPERATOR_NOC, STOP_NAME, STOP_ATCO, STOP_LAT, STOP_LON,
+    LEGS, LINE_REF, OPERATOR_NOC, STOP_NAME, STOP_ATCO, STOP_LAT, STOP_LON,
     DIRECTION, DEST_KEYWORDS, DEST_LABEL,
 )
 INBOUND_DIRECTION_REF = DIRECTION    # alias used by direction_ok()
+_ALL_STOP_ATCOS = {leg["stop_atco"] for leg in LEGS}
 
 # Geometry-ETA assumption. ~18 km/h is a typical urban bus average INCLUDING
 # stop dwell time. Tune it once you can compare estimate vs reality.
@@ -67,11 +68,13 @@ SHOW_N = 5
 # here; the GUI loads it from the accuracy log and assigns it.
 CALIBRATION = None
 
-# Bounding box around the stop, biased EAST (toward Ashton) to catch buses
-# approaching. East = larger (less negative) longitude here. Format that BODS
-# wants: minLon,minLat,maxLon,maxLat
-BBOX_MIN_LON = STOP_LON - 0.02   # a little to the Manchester side (to spot just-passed buses)
-BBOX_MAX_LON = STOP_LON + 0.06   # well toward Ashton
+# Bounding box around the stop. Originally biased east only (toward Ashton), on
+# the assumption we only cared about buses approaching from that side. Now that
+# LEGS tracks both directions, we need matching reach on the west (Manchester)
+# side too, for buses approaching the return leg. Symmetric ~4km east/west.
+# Format that BODS wants: minLon,minLat,maxLon,maxLat
+BBOX_MIN_LON = STOP_LON - 0.06
+BBOX_MAX_LON = STOP_LON + 0.06
 BBOX_MIN_LAT = STOP_LAT - 0.03
 BBOX_MAX_LAT = STOP_LAT + 0.03
 
@@ -173,20 +176,18 @@ def parse_vehicles(xml_text):
 
         bearing = text_of(mvj, "s:Bearing")
 
-        # Look for an operator-provided arrival time at OUR stop, in either the
-        # current MonitoredCall or any OnwardCall.
-        expected_at_stop = None
+        # Look for an operator-provided arrival time at any of our tracked stops,
+        # in either the current MonitoredCall or any OnwardCall. Keyed by ATCO so
+        # each leg can pick out its own stop's value.
+        expected_by_atco = {}
         for call_path in ("s:MonitoredCall", "s:OnwardCalls/s:OnwardCall"):
             for call in mvj.iterfind(call_path, NS):
                 ref = text_of(call, "s:StopPointRef")
-                if ref == STOP_ATCO:
-                    expected_at_stop = (
-                        parse_time(text_of(call, "s:ExpectedArrivalTime"))
-                        or parse_time(text_of(call, "s:AimedArrivalTime"))
-                    )
-                    break
-            if expected_at_stop:
-                break
+                if ref in _ALL_STOP_ATCOS and ref not in expected_by_atco:
+                    t = (parse_time(text_of(call, "s:ExpectedArrivalTime"))
+                         or parse_time(text_of(call, "s:AimedArrivalTime")))
+                    if t:
+                        expected_by_atco[ref] = t
 
         yield {
             "vehicle": text_of(mvj, "s:VehicleRef"),
@@ -202,26 +203,32 @@ def parse_vehicles(xml_text):
             "lon": float(lon),
             "bearing": float(bearing) if bearing else None,
             "recorded": parse_time(text_of(va, "s:RecordedAtTime")),
-            "expected_at_stop": expected_at_stop,
+            "expected_by_atco": expected_by_atco,
         }
 
 # ============================ ETA LOGIC ============================
 
-def estimate(v, now):
-    """Attach distance, approaching flag, eta_min, and source to a vehicle dict."""
-    dist = haversine_km(v["lat"], v["lon"], STOP_LAT, STOP_LON)
+_DEFAULT_LEG = LEGS[0]
+
+
+def estimate_for(v, now, leg=_DEFAULT_LEG):
+    """Attach distance, approaching flag, eta_min, and source to a vehicle dict,
+    relative to the given leg's stop. Only call this on vehicles already known
+    to belong to that leg's direction."""
+    dist = haversine_km(v["lat"], v["lon"], leg["stop_lat"], leg["stop_lon"])
     v["dist_km"] = dist
 
     # Is it heading toward the stop? Only knowable if we have a bearing.
-    to_stop = bearing_deg(v["lat"], v["lon"], STOP_LAT, STOP_LON)
+    to_stop = bearing_deg(v["lat"], v["lon"], leg["stop_lat"], leg["stop_lon"])
     if v["bearing"] is None:
         v["approaching"] = None  # unknown
     else:
         v["approaching"] = angle_diff(v["bearing"], to_stop) <= APPROACH_BEARING_TOLERANCE_DEG
 
     v["eta_band"] = None
-    if v["expected_at_stop"] is not None:
-        v["eta_min"] = (v["expected_at_stop"] - now).total_seconds() / 60.0
+    expected_at_stop = v.get("expected_by_atco", {}).get(leg["stop_atco"])
+    if expected_at_stop is not None:
+        v["eta_min"] = (expected_at_stop - now).total_seconds() / 60.0
         v["source"] = "operator"  # someone else's prediction, relayed
     elif CALIBRATION is not None:
         v["eta_min"] = CALIBRATION.eta(dist)
@@ -233,25 +240,40 @@ def estimate(v, now):
     return v
 
 
-def dest_matches(v):
+def estimate(v, now):
+    """Back-compat: estimate relative to the first configured leg."""
+    return estimate_for(v, now, _DEFAULT_LEG)
+
+
+def dest_matches_for(v, leg=_DEFAULT_LEG):
     d = (v["destination"] or "").lower()
     if not d:
         return None  # unknown, cannot tell direction from destination
-    return any(k in d for k in DEST_KEYWORDS)
+    return any(k in d for k in leg["dest_keywords"])
 
 
-def direction_ok(v):
-    """True if Manchester-bound, False if not, None if undeterminable.
+def dest_matches(v):
+    return dest_matches_for(v, _DEFAULT_LEG)
+
+
+def direction_ok_for(v, leg=_DEFAULT_LEG):
+    """True if this vehicle is heading the way this leg cares about, False if
+    not, None if undeterminable.
 
     Primary signal is DirectionRef (structured). If it is missing, fall back to
     matching the destination text.
     """
     dr = (v["direction_ref"] or "").lower()
-    if dr == INBOUND_DIRECTION_REF:
+    if dr == leg["direction"]:
         return True
-    if dr:  # some other direction string, e.g. "outbound"
+    if dr:  # some other direction string
         return False
-    return dest_matches(v)  # DirectionRef absent, fall back
+    return dest_matches_for(v, leg)  # DirectionRef absent, fall back
+
+
+def direction_ok(v):
+    """Back-compat: direction check against the first configured leg."""
+    return direction_ok_for(v, _DEFAULT_LEG)
 
 # ============================ ACCURACY LOGGER ============================
 
@@ -270,7 +292,8 @@ class AccuracyLogger:
         "error_min", "source",
     ]
 
-    ARRIVAL_COLUMNS = ["arrived_at", "vehicle", "delay_min", "hour", "on_time"]
+    ARRIVAL_COLUMNS = ["arrived_at", "vehicle", "delay_min", "hour", "on_time",
+                       "snap_dist_km", "stops_in_journey"]
 
     def __init__(self, path, arrival_radius_km, cooldown_min, arrivals_path=None):
         self.path = path
@@ -282,11 +305,31 @@ class AccuracyLogger:
         if not os.path.exists(self.path):
             with open(self.path, "w", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow(self.COLUMNS)
-        if arrivals_path and not os.path.exists(arrivals_path):
-            with open(arrivals_path, "w", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerow(self.ARRIVAL_COLUMNS)
+        if arrivals_path:
+            if not os.path.exists(arrivals_path):
+                with open(arrivals_path, "w", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerow(self.ARRIVAL_COLUMNS)
+            else:
+                self._migrate_arrivals(arrivals_path)
+
+    def _migrate_arrivals(self, path):
+        """Add any new ARRIVAL_COLUMNS to an existing file, padding old rows with
+        blanks, so old and new logging code agree on column positions."""
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            existing_header = reader.fieldnames or []
+            rows = list(reader)
+        if existing_header == self.ARRIVAL_COLUMNS:
+            return
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(self.ARRIVAL_COLUMNS)
+            for r in rows:
+                w.writerow([r.get(col, "") for col in self.ARRIVAL_COLUMNS])
 
     def update(self, now, vehicles):
+        """vehicles must already be filtered to this logger's leg/direction -
+        this method does not re-check direction, only arrival/approaching."""
         for v in vehicles:
             veh = v["vehicle"]
             if veh is None:
@@ -312,8 +355,9 @@ class AccuracyLogger:
             if in_cooldown:
                 continue
 
-            # Only record predictions for buses genuinely heading our way.
-            if direction_ok(v) is False or v["approaching"] is False:
+            # Only record predictions for buses not clearly moving away (the
+            # caller is responsible for direction filtering before calling us).
+            if v["approaching"] is False:
                 continue
 
             self.history.setdefault(veh, []).append({
@@ -359,6 +403,7 @@ class AccuracyLogger:
         local = actual.astimezone(_LONDON)
         delay_min = ds / 60.0
         on_time = -1.0 <= delay_min <= 5.0       # UK bus punctuality standard
+        snap = v.get("snap_dist_km")
         with open(self.arrivals_path, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow([
                 local.isoformat(timespec="seconds"),
@@ -366,6 +411,8 @@ class AccuracyLogger:
                 f"{delay_min:.1f}",
                 local.hour,
                 int(on_time),
+                f"{snap:.3f}" if snap is not None else "",
+                v.get("journey_stops", ""),
             ])
 
 

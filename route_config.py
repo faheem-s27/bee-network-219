@@ -1,31 +1,63 @@
 """
 ========================================================================
-THE ONLY FILE YOU EDIT TO CHANGE THE BUS / STOP.
+THE ONLY FILE YOU EDIT TO CHANGE THE BUS / STOP(S).
 ========================================================================
 
-To switch to a different line and stop:
+LEGS is a list of directions to track. Two by default: out and back. Each entry
+is independent (its own stop, direction, destination match) so a round trip just
+means two entries pointing at the two stops for the same road.
 
-  1. Find your stop on https://bustimes.org . Open the stop page. It shows the
-     ATCO code (e.g. 1800EB34051) and the coordinates. Put them below, and set
-     LINE_REF to the bus number. Pick the stop on the correct side of the road
-     for the direction you travel.
+To switch or add a leg:
+
+  1. Find the stop on https://bustimes.org . The stop page shows the ATCO code
+     and coordinates. Pick the stop on the correct side of the road for the
+     direction that leg travels.
 
   2. Run:  python discover.py
-     It reads the live feed and prints the exact OPERATOR_NOC, DIRECTION,
-     DEST_KEYWORDS and DEST_LABEL lines to paste back here. No guessing.
+     It reads the live feed and prints the exact operator_noc, direction,
+     dest_keywords, dest_label for a line right now. No guessing.
 
   3. If running on the Pi, restart it:  sudo systemctl restart bus219
-     (Edit this file ON THE PI, because the Pi is what does the tracking.)
+     (Edit this file ON THE PI - the Pi is what does the tracking.)
+
+To track only one direction, just leave one entry in LEGS.
 """
 
-LINE_REF = "219"
-OPERATOR_NOC = "BNML"                       # operator code (discover.py prints it)
+LEGS = [
+    {
+        "key": "to_manchester",
+        "line_ref": "219",
+        "operator_noc": "BNML",
+        "stop_name": "Openshaw, near Lees Street",
+        "stop_atco": "1800EB34051",
+        "stop_lat": 53.472860,
+        "stop_lon": -2.168243,
+        "direction": "inbound",                       # feed's DirectionRef
+        "dest_keywords": ["piccadilly", "manchester"],  # fallback text match
+        "dest_label": "Manchester City Centre",
+    },
+    {
+        "key": "to_ashton",
+        "line_ref": "219",
+        "operator_noc": "BNML",
+        "stop_name": "Openshaw, opp Lees Street",
+        "stop_atco": "1800EB34041",
+        "stop_lat": 53.473030,
+        "stop_lon": -2.168876,
+        "direction": "outbound",
+        "dest_keywords": ["ashton", "stalybridge", "glossop"],
+        "dest_label": "Ashton-under-Lyne",
+    },
+]
 
-STOP_NAME = "Openshaw, near Lees Street"    # any label you like
-STOP_ATCO = "1800EB34051"
-STOP_LAT = 53.472860
-STOP_LON = -2.168243
-
-DIRECTION = "inbound"                        # the feed's DirectionRef toward you go
-DEST_KEYWORDS = ["piccadilly", "manchester"]  # fallback text match
-DEST_LABEL = "Manchester City Centre"          # shown as the GUI title
+# Back-compat single-route constants (= LEGS[0]). Old scripts / discover.py's
+# defaults / standalone geometry-fallback code still read these.
+LINE_REF = LEGS[0]["line_ref"]
+OPERATOR_NOC = LEGS[0]["operator_noc"]
+STOP_NAME = LEGS[0]["stop_name"]
+STOP_ATCO = LEGS[0]["stop_atco"]
+STOP_LAT = LEGS[0]["stop_lat"]
+STOP_LON = LEGS[0]["stop_lon"]
+DIRECTION = LEGS[0]["direction"]
+DEST_KEYWORDS = LEGS[0]["dest_keywords"]
+DEST_LABEL = LEGS[0]["dest_label"]

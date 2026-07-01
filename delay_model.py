@@ -25,21 +25,25 @@ Honest limits (stated, not hidden):
     cannot be matched or has no usable coordinates.
 """
 
+from datetime import timedelta
 from zoneinfo import ZoneInfo
 
 import next_219 as core
 import schedule_219 as sch
 
 LONDON = ZoneInfo("Europe/London")
+_DEFAULT_LEG = core.LEGS[0]
 
 
-def predict(vehicle, now_utc):
-    """Return a dict with delay-based ETA, or None to fall back to geometry."""
-    seq = sch.journey_for(vehicle)
+def predict(vehicle, now_utc, leg=_DEFAULT_LEG):
+    """Return a dict with delay-based ETA for the given leg's stop, or None to
+    fall back to geometry. 'leg' is one of route_config.LEGS."""
+    direction, stop_atco = leg["direction"], leg["stop_atco"]
+    seq = sch.journey_for(vehicle, direction, stop_atco)
     if not seq:
         return None
 
-    lees_i = next((i for i, s in enumerate(seq) if s[0] == sch.STOP_ATCO), None)
+    lees_i = next((i for i, s in enumerate(seq) if s[0] == stop_atco), None)
     if lees_i is None:
         return None
 
@@ -66,13 +70,14 @@ def predict(vehicle, now_utc):
         delay += 86400
 
     lees_secs = seq[lees_i][1]
-    from datetime import timedelta
-    predicted_lees = sch.secs_to_local_dt(lees_secs, now_utc) + timedelta(seconds=delay)
+    scheduled_dt = sch.secs_to_local_dt(lees_secs, now_utc)
+    predicted_lees = scheduled_dt + timedelta(seconds=delay)
     eta_min = (predicted_lees - now_local).total_seconds() / 60.0
 
     return {
         "eta_min": eta_min,
         "delay_secs": delay,
+        "scheduled_dt": scheduled_dt,   # pure timetable time, no live delay applied
         "predicted_lees": predicted_lees,
         "passed": j > lees_i,          # snapped past Lees -> already gone
         "arrived": j >= lees_i,        # nearest stop is Lees or beyond = at/through it
