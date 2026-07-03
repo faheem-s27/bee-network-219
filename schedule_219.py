@@ -330,16 +330,30 @@ def _match_key(vehicle, direction, stop_atco):
     return cands[0] if len(cands) == 1 else None
 
 
+# A match whose scheduled time sits further than this from 'now' is almost
+# certainly a stale journey match, not a real fact about a route running every
+# few minutes (see delay_model.py's docstring for the full explanation: the
+# live feed sometimes reports a vehicle's PREVIOUS trip's aimed times for a
+# window after it starts a new one). Mirrors delay_model.MAX_PLAUSIBLE_DELAY_MIN;
+# kept as its own constant so this module does not depend on delay_model.
+MAX_PLAUSIBLE_OFFSET_MIN = 60.0
+
+
 def scheduled_lees(vehicle, now, direction=None, stop_atco=None):
-    """Scheduled datetime (aware) at the given stop for a live vehicle, or None.
-    Defaults to the first configured leg for back-compat."""
+    """Scheduled datetime (aware) at the given stop for a live vehicle, or None
+    if it cannot be matched OR the match is implausibly far from 'now' (a stale
+    match, not a real fact). Defaults to the first configured leg for back-compat."""
     direction = direction or INBOUND
     stop_atco = stop_atco or STOP_ATCO
     sched = warm(direction, stop_atco)
     key = _match_key(vehicle, direction, stop_atco)
     if key is None:
         return None
-    return secs_to_local_dt(sched[key], now)
+    dt = secs_to_local_dt(sched[key], now)
+    offset_min = abs((dt - now.astimezone(LONDON)).total_seconds()) / 60.0
+    if offset_min > MAX_PLAUSIBLE_OFFSET_MIN:
+        return None
+    return dt
 
 
 def journey_for(vehicle, direction=None, stop_atco=None):

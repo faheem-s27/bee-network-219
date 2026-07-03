@@ -23,6 +23,17 @@ Honest limits (stated, not hidden):
     it. Not done yet.
   - Falls back to None (caller keeps the geometry estimate) whenever the journey
     cannot be matched or has no usable coordinates.
+  - Also falls back to None if the computed delay is implausibly large (see
+    MAX_PLAUSIBLE_DELAY_MIN below) - found in the wild as ~40-56% of ALL logged
+    arrivals on both legs, always positive (never early), a smooth range from
+    just over an hour to 10+ hours. That pattern (one-directional, real journey
+    shapes, not random noise) points to the live feed occasionally reporting a
+    STALE OriginAimedDepartureTime/DestinationAimedArrivalTime for a vehicle -
+    still describing its PREVIOUS trip for a window after it starts a new one.
+    We then match against a real, valid, but hours-stale scheduled journey.
+    Rejecting it here (not just downstream in reliability.py) matters because
+    an unguarded bad match doesn't just corrupt statistics later - it would
+    show a wildly wrong ETA on the live board right now.
 """
 
 from datetime import timedelta
@@ -33,6 +44,7 @@ import schedule_219 as sch
 
 LONDON = ZoneInfo("Europe/London")
 _DEFAULT_LEG = core.LEGS[0]
+MAX_PLAUSIBLE_DELAY_MIN = 60.0
 
 
 def predict(vehicle, now_utc, leg=_DEFAULT_LEG):
@@ -68,6 +80,15 @@ def predict(vehicle, now_utc, leg=_DEFAULT_LEG):
         delay -= 86400
     elif delay < -43200:
         delay += 86400
+
+    if abs(delay) > MAX_PLAUSIBLE_DELAY_MIN * 60:
+        # Almost certainly a stale journey match (see module docstring), not a
+        # real delay on a route with a headway measured in minutes. Refuse the
+        # match entirely rather than hand back a number that looks measured.
+        print(f"  [delay_model] rejected implausible match for {vehicle.get('vehicle')}: "
+              f"{delay/60:+.0f} min (key would have been origin/dest "
+              f"{vehicle.get('origin_aimed_dep')} / {vehicle.get('dest_aimed_arr')})")
+        return None
 
     lees_secs = seq[lees_i][1]
     scheduled_dt = sch.secs_to_local_dt(lees_secs, now_utc)
